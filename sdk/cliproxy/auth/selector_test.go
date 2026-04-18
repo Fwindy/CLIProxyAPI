@@ -313,6 +313,90 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testin
 	}
 }
 
+func TestIsAuthBlockedForModel_CodexQuotaBlocksAllModels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(15 * time.Minute)
+	auth := &Auth{
+		ID:             "codex-a",
+		Provider:       "codex",
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: next,
+		},
+		ModelStates: map[string]*ModelState{
+			"gpt-5.4": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+		},
+	}
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "gpt-5.4-mini", now)
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if !gotNext.Equal(next) {
+		t.Fatalf("next = %v, want %v", gotNext, next)
+	}
+}
+
+func TestIsAuthBlockedForModel_CodexQuotaOverridesOtherModelState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(20 * time.Minute)
+	auth := &Auth{
+		ID:       "codex-a",
+		Provider: "codex",
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: next,
+		},
+		ModelStates: map[string]*ModelState{
+			"gpt-5.4": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+			"gpt-5.4-mini": {
+				Status:      StatusActive,
+				Unavailable: false,
+			},
+		},
+	}
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "gpt-5.4-mini", now)
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if !gotNext.Equal(next) {
+		t.Fatalf("next = %v, want %v", gotNext, next)
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

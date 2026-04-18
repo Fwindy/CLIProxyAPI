@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -23,6 +24,7 @@ const (
 	apiAttemptsKey          = "API_UPSTREAM_ATTEMPTS"
 	apiRequestKey           = "API_REQUEST"
 	apiResponseKey          = "API_RESPONSE"
+	apiResponseErrorsKey    = "API_RESPONSE_ERROR"
 	apiWebsocketTimelineKey = "API_WEBSOCKET_TIMELINE"
 	creditsUsedKey          = "__antigravity_credits_used__"
 )
@@ -130,11 +132,17 @@ func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 
 // RecordAPIResponseError adds an error entry for the latest attempt when no HTTP response is available.
 func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) {
-	if cfg == nil || !cfg.RequestLog || err == nil {
+	if err == nil {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
+		return
+	}
+	if cfg == nil || !cfg.RequestLog {
+		recordAPIResponseErrorMarker(ginCtx, err)
+		markAPIResponseTimestamp(ginCtx)
+		appendAPIResponseError(ginCtx, err)
 		return
 	}
 	attempts, attempt := ensureAttempt(ginCtx)
@@ -312,24 +320,22 @@ func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload
 
 // RecordAPIWebsocketError stores an upstream websocket error event in Gin context.
 func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage string, err error) {
-	if cfg == nil || !cfg.RequestLog || err == nil {
+	if err == nil {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
 	}
+	if cfg == nil || !cfg.RequestLog {
+		recordAPIResponseErrorMarker(ginCtx, err)
+		markAPIResponseTimestamp(ginCtx)
+		appendAPIWebsocketTimeline(ginCtx, buildAPIWebsocketErrorEvent(stage, err))
+		return
+	}
 	markAPIResponseTimestamp(ginCtx)
 
-	builder := &strings.Builder{}
-	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
-	builder.WriteString("Event: api.websocket.error\n")
-	if trimmed := strings.TrimSpace(stage); trimmed != "" {
-		builder.WriteString(fmt.Sprintf("Stage: %s\n", trimmed))
-	}
-	builder.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
-
-	appendAPIWebsocketTimeline(ginCtx, []byte(builder.String()))
+	appendAPIWebsocketTimeline(ginCtx, buildAPIWebsocketErrorEvent(stage, err))
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {
@@ -449,6 +455,80 @@ func markAPIResponseTimestamp(ginCtx *gin.Context) {
 		return
 	}
 	ginCtx.Set("API_RESPONSE_TIMESTAMP", time.Now())
+}
+
+func recordAPIResponseErrorMarker(ginCtx *gin.Context, err error) {
+	if ginCtx == nil || err == nil {
+		return
+	}
+
+	errorMessage := &interfaces.ErrorMessage{
+		StatusCode: errorStatusCode(err),
+		Error:      err,
+	}
+	if existing, exists := ginCtx.Get(apiResponseErrorsKey); exists {
+		if existingErrors, ok := existing.([]*interfaces.ErrorMessage); ok {
+			ginCtx.Set(apiResponseErrorsKey, append(existingErrors, errorMessage))
+			return
+		}
+	}
+	ginCtx.Set(apiResponseErrorsKey, []*interfaces.ErrorMessage{errorMessage})
+}
+
+func appendAPIResponseError(ginCtx *gin.Context, err error) {
+	if ginCtx == nil || err == nil {
+		return
+	}
+
+	builder := &strings.Builder{}
+	if existing, exists := ginCtx.Get(apiResponseKey); exists {
+		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
+			builder.Write(existingBytes)
+			if !bytes.HasSuffix(existingBytes, []byte("\n")) {
+				builder.WriteString("\n")
+			}
+			builder.WriteString("\n")
+			builder.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+			ginCtx.Set(apiResponseKey, []byte(builder.String()))
+			return
+		}
+	}
+
+	builder.WriteString("=== API RESPONSE ===\n")
+	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
+	if status := errorStatusCode(err); status > 0 {
+		builder.WriteString(fmt.Sprintf("Status: %d\n", status))
+	}
+	builder.WriteString("\n")
+	builder.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+	ginCtx.Set(apiResponseKey, []byte(builder.String()))
+}
+
+func buildAPIWebsocketErrorEvent(stage string, err error) []byte {
+	if err == nil {
+		return nil
+	}
+
+	builder := &strings.Builder{}
+	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
+	builder.WriteString("Event: api.websocket.error\n")
+	if trimmed := strings.TrimSpace(stage); trimmed != "" {
+		builder.WriteString(fmt.Sprintf("Stage: %s\n", trimmed))
+	}
+	builder.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+	return []byte(builder.String())
+}
+
+func errorStatusCode(err error) int {
+	if err == nil {
+		return http.StatusBadGateway
+	}
+	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		if code := se.StatusCode(); code > 0 {
+			return code
+		}
+	}
+	return http.StatusBadGateway
 }
 
 func writeHeaders(builder *strings.Builder, headers http.Header) {

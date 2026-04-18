@@ -14,6 +14,7 @@ type authAutoRefreshLoop struct {
 	manager     *Manager
 	interval    time.Duration
 	concurrency int
+	jobInterval time.Duration
 
 	mu    sync.Mutex
 	queue refreshMinHeap
@@ -39,6 +40,7 @@ func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrenc
 		manager:     manager,
 		interval:    interval,
 		concurrency: concurrency,
+		jobInterval: refreshQueueInterval,
 		index:       make(map[string]*refreshHeapItem),
 		dirty:       make(map[string]struct{}),
 		wakeCh:      make(chan struct{}, 1),
@@ -64,19 +66,31 @@ func (l *authAutoRefreshLoop) run(ctx context.Context) {
 		return
 	}
 
-	workers := l.concurrency
-	if workers <= 0 {
-		workers = refreshMaxConcurrency
-	}
-	for i := 0; i < workers; i++ {
-		go l.worker(ctx)
-	}
+	go l.worker(ctx)
 
 	l.loop(ctx)
 }
 
 func (l *authAutoRefreshLoop) worker(ctx context.Context) {
+	var nextAllowed time.Time
 	for {
+		if !nextAllowed.IsZero() {
+			wait := time.Until(nextAllowed)
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				case <-timer.C:
+				}
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -84,8 +98,14 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 			if authID == "" {
 				continue
 			}
+			startedAt := time.Now()
 			l.manager.refreshAuth(ctx, authID)
 			l.queueReschedule(authID)
+			if l.jobInterval > 0 {
+				nextAllowed = startedAt.Add(l.jobInterval)
+			} else {
+				nextAllowed = time.Time{}
+			}
 		}
 	}
 }
@@ -336,7 +356,7 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 }
 
 func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time.Time, bool) {
-	if auth == nil || auth.Disabled {
+	if auth == nil || auth.Disabled || auth.RefreshDisabled() {
 		return time.Time{}, false
 	}
 

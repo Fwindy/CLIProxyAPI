@@ -63,6 +63,7 @@ type RefreshEvaluator interface {
 const (
 	refreshCheckInterval  = 5 * time.Second
 	refreshMaxConcurrency = 16
+	refreshQueueInterval  = time.Minute
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
 	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns
@@ -142,13 +143,14 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store     Store
-	executors map[string]ProviderExecutor
-	selector  Selector
-	hook      Hook
-	mu        sync.RWMutex
-	auths     map[string]*Auth
-	scheduler *authScheduler
+	store      Store
+	executors  map[string]ProviderExecutor
+	selector   Selector
+	hook       Hook
+	mu         sync.RWMutex
+	auths      map[string]*Auth
+	refreshing map[string]struct{}
+	scheduler  *authScheduler
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -193,6 +195,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		selector:         selector,
 		hook:             hook,
 		auths:            make(map[string]*Auth),
+		refreshing:       make(map[string]struct{}),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 	}
@@ -288,7 +291,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	auth, ok := m.auths[authID]
 	if ok && auth != nil && len(auth.ModelStates) > 0 {
 		changed := false
-		for modelKey, state := range auth.ModelStates {
+		for modelKey := range auth.ModelStates {
 			baseModel := canonicalModelKey(modelKey)
 			if baseModel == "" {
 				baseModel = strings.TrimSpace(modelKey)
@@ -301,14 +304,6 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				changed = true
 				continue
 			}
-			if state == nil {
-				continue
-			}
-			if modelStateIsClean(state) {
-				continue
-			}
-			resetModelState(state, now)
-			changed = true
 		}
 		if len(auth.ModelStates) == 0 {
 			auth.ModelStates = nil
@@ -1310,10 +1305,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		auth = m.ensureCodexInstallationID(ctx, provider, auth, codexInstallationIDRequestPayload(req, opts))
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		if m.scheduler != nil {
+			m.scheduler.rememberCodexAffinity(ctx, provider, auth.ID)
+		}
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -1389,10 +1388,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		auth = m.ensureCodexInstallationID(ctx, provider, auth, codexInstallationIDRequestPayload(req, opts))
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		if m.scheduler != nil {
+			m.scheduler.rememberCodexAffinity(ctx, provider, auth.ID)
+		}
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -1468,10 +1471,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, errPick
 		}
+		auth = m.ensureCodexInstallationID(ctx, provider, auth, codexInstallationIDRequestPayload(req, opts))
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		if m.scheduler != nil {
+			m.scheduler.rememberCodexAffinity(ctx, provider, auth.ID)
+		}
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -1520,6 +1527,38 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 	return opts
 }
 
+func (m *Manager) ensureCodexInstallationID(ctx context.Context, provider string, auth *Auth, body []byte) *Auth {
+	if m == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(provider), "codex") || !CodexInstallationIDRequested(ctx, body) {
+		return auth
+	}
+
+	var snapshot *Auth
+	var changed bool
+
+	m.mu.Lock()
+	current := m.auths[auth.ID]
+	if current == nil {
+		current = auth.Clone()
+	}
+	_, changed = EnsureCodexInstallationID(current)
+	snapshot = current.Clone()
+	if tracked := m.auths[auth.ID]; tracked != nil {
+		tracked.Metadata = snapshot.Metadata
+	}
+	m.mu.Unlock()
+
+	if changed {
+		persistCtx := context.Background()
+		if ctx != nil {
+			persistCtx = context.WithoutCancel(ctx)
+		}
+		if err := m.persist(persistCtx, snapshot); err != nil {
+			log.Warnf("failed to persist codex installation id for %s: %v", snapshot.ID, err)
+		}
+	}
+	return snapshot
+}
+
 func hasRequestedModelMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false
@@ -1566,6 +1605,31 @@ func requestedModelAliasFromOptions(opts cliproxyexecutor.Options, fallback stri
 	default:
 		return fallback
 	}
+}
+
+func codexInstallationIDRequestPayload(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) []byte {
+	if len(opts.OriginalRequest) > 0 {
+		return opts.OriginalRequest
+	}
+	return req.Payload
+}
+
+func codexInstallationIDRequestBodyFromHTTPRequest(req *http.Request) []byte {
+	if req == nil || req.GetBody == nil {
+		return nil
+	}
+	bodyReader, err := req.GetBody()
+	if err != nil || bodyReader == nil {
+		return nil
+	}
+	defer func() {
+		_ = bodyReader.Close()
+	}()
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return nil
+	}
+	return body
 }
 
 func pinnedAuthIDFromMetadata(meta map[string]any) string {
@@ -3270,8 +3334,37 @@ func (m *Manager) queueRefreshReschedule(authID string) {
 	loop.queueReschedule(authID)
 }
 
+func permanentRefreshErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	raw := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(raw, "refresh_token_reused"):
+		return "refresh_token_reused"
+	default:
+		return ""
+	}
+}
+
+func markRefreshDisabled(auth *Auth, reason string) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["refresh_disabled"] = true
+	if strings.TrimSpace(reason) != "" {
+		auth.Metadata["refresh_disabled_reason"] = strings.TrimSpace(reason)
+	} else {
+		delete(auth.Metadata, "refresh_disabled_reason")
+	}
+	auth.NextRefreshAfter = time.Time{}
+}
+
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
-	if a == nil || a.Disabled {
+	if a == nil || a.Disabled || a.RefreshDisabled() {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -3482,22 +3575,37 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 		m.mu.Unlock()
 		return false
 	}
+	if _, inFlight := m.refreshing[id]; inFlight {
+		m.mu.Unlock()
+		return false
+	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
 		m.mu.Unlock()
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
+	m.refreshing[id] = struct{}{}
 	m.mu.Unlock()
 
 	m.queueRefreshReschedule(id)
 	return true
 }
 
+func (m *Manager) clearRefreshPending(id string) {
+	if m == nil || id == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.refreshing, id)
+	m.mu.Unlock()
+}
+
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	defer m.clearRefreshPending(id)
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor
@@ -3519,17 +3627,27 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		shouldReschedule := false
+		var snapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			if reason := permanentRefreshErrorReason(err); reason != "" {
+				markRefreshDisabled(current, reason)
+			} else {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			}
 			current.LastError = &Error{Message: err.Error()}
+			current.UpdatedAt = now
 			m.auths[id] = current
 			shouldReschedule = true
+			snapshot = current.Clone()
 			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				m.scheduler.upsertAuth(snapshot.Clone())
 			}
 		}
 		m.mu.Unlock()
+		if snapshot != nil {
+			_ = m.persist(ctx, snapshot)
+		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}
@@ -3706,6 +3824,7 @@ func (m *Manager) PrepareHttpRequest(ctx context.Context, auth *Auth, req *http.
 	if providerKey == "" {
 		return &Error{Code: "provider_not_found", Message: "auth provider is empty"}
 	}
+	auth = m.ensureCodexInstallationID(ctx, providerKey, auth, codexInstallationIDRequestBodyFromHTTPRequest(req))
 	exec := m.executorFor(providerKey)
 	if exec == nil {
 		return &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
@@ -3758,6 +3877,7 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	if providerKey == "" {
 		return nil, &Error{Code: "provider_not_found", Message: "auth provider is empty"}
 	}
+	auth = m.ensureCodexInstallationID(ctx, providerKey, auth, codexInstallationIDRequestBodyFromHTTPRequest(req))
 	exec := m.executorFor(providerKey)
 	if exec == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}

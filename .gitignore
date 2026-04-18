@@ -35,7 +35,8 @@ GEMINI.md
 # Tooling metadata
 .vscode/*
 .worktrees/
-.codex/*
+.codex
+.codex/
 .claude/*
 .gemini/*
 .serena/*
@@ -47,8 +48,12 @@ GEMINI.md
 .bmad/*
 _bmad/*
 _bmad-output/*
+.cli-proxy-api/
+.venv/
+dist/
 
 # macOS
 .DS_Store
 ._*
 .gocache/
+.omx/

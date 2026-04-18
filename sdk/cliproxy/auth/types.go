@@ -391,6 +391,22 @@ func (a *Auth) ToolPrefixDisabled() bool {
 	return false
 }
 
+// RefreshDisabled reports whether background refresh should stay disabled for this auth.
+// The value is read from metadata key "refresh_disabled" (or "refresh-disabled").
+func (a *Auth) RefreshDisabled() bool {
+	if a == nil || a.Metadata == nil {
+		return false
+	}
+	for _, key := range []string{"refresh_disabled", "refresh-disabled"} {
+		if val, ok := a.Metadata[key]; ok {
+			if parsed, okParse := parseBoolAny(val); okParse {
+				return parsed
+			}
+		}
+	}
+	return false
+}
+
 // RequestRetryOverride returns the auth-file scoped request_retry override when present.
 // The value is read from metadata key "request_retry" (or legacy "request-retry").
 func (a *Auth) RequestRetryOverride() (int, bool) {

@@ -1,21 +1,26 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	gin "github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
@@ -174,6 +179,79 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 
 	if remaining := redisqueue.PopOldest(1); len(remaining) != 0 {
 		t.Fatalf("remaining queue = %q, want empty", remaining)
+	}
+}
+
+func TestServerDecompressesZstdRequestBodies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+
+	cfg := &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys: []string{"test-key"},
+		},
+		Port:                   0,
+		AuthDir:                authDir,
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+	}
+
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	server := NewServer(
+		cfg,
+		auth.NewManager(nil, nil, nil),
+		sdkaccess.NewManager(),
+		configPath,
+		WithRouterConfigurator(func(engine *gin.Engine, _ *handlers.BaseAPIHandler, _ *proxyconfig.Config) {
+			engine.POST("/echo", func(c *gin.Context) {
+				body, errRead := io.ReadAll(c.Request.Body)
+				if errRead != nil {
+					c.String(http.StatusInternalServerError, "read error: %v", errRead)
+					return
+				}
+				c.Header("X-Seen-Content-Encoding", c.Request.Header.Get("Content-Encoding"))
+				c.Header("X-Seen-Content-Length", c.Request.Header.Get("Content-Length"))
+				c.String(http.StatusOK, string(body))
+			})
+		}),
+	)
+
+	wantBody := []byte(`{"client_metadata":{"x-codex-installation-id":"client-installation-id"}}`)
+	var compressed bytes.Buffer
+	encoder, err := zstd.NewWriter(&compressed)
+	if err != nil {
+		t.Fatalf("zstd.NewWriter() error = %v", err)
+	}
+	if _, err = encoder.Write(wantBody); err != nil {
+		t.Fatalf("encoder.Write() error = %v", err)
+	}
+	encoder.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/echo", bytes.NewReader(compressed.Bytes()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+	req.Header.Set("Content-Length", "999")
+	rr := httptest.NewRecorder()
+
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Body.Bytes(); !bytes.Equal(got, wantBody) {
+		t.Fatalf("body = %s, want %s", got, wantBody)
+	}
+	if got := rr.Header().Get("X-Seen-Content-Encoding"); got != "" {
+		t.Fatalf("handler saw Content-Encoding = %q, want empty", got)
+	}
+	if got := rr.Header().Get("X-Seen-Content-Length"); got != strconv.Itoa(len(wantBody)) {
+		t.Fatalf("handler saw Content-Length = %q, want %q", got, strconv.Itoa(len(wantBody)))
 	}
 }
 

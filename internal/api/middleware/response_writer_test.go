@@ -2,13 +2,20 @@ package middleware
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 )
 
 func TestExtractRequestBodyPrefersOverride(t *testing.T) {
@@ -152,6 +159,118 @@ func TestFinalizeStreamingWritesAPIWebsocketTimeline(t *testing.T) {
 	if !streamWriter.closed {
 		t.Fatal("expected stream writer to be closed")
 	}
+}
+
+func TestFinalizeForceLogsAPIResponseErrorWhenLoggerDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logDir := t.TempDir()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	wrapper := &ResponseWriterWrapper{
+		ResponseWriter: c.Writer,
+		logger:         logging.NewFileRequestLogger(false, logDir, "", 10),
+		requestInfo: &RequestInfo{
+			URL:       "/v1/responses",
+			Method:    "POST",
+			Headers:   map[string][]string{"Content-Type": {"application/json"}},
+			Body:      []byte(`{"model":"codex-mini-latest","stream":true}`),
+			RequestID: "req-response-error",
+			Timestamp: time.Date(2026, time.April, 14, 12, 0, 0, 0, time.UTC),
+		},
+		logOnErrorOnly: true,
+		isStreaming:    true,
+	}
+	c.Writer = wrapper
+
+	ctx := context.WithValue(context.Background(), "gin", c)
+	helps.RecordAPIResponseError(ctx, &config.Config{SDKConfig: config.SDKConfig{RequestLog: false}}, errors.New("upstream stream disconnected"))
+
+	if err := wrapper.Finalize(c); err != nil {
+		t.Fatalf("Finalize error: %v", err)
+	}
+
+	logPath := singleErrorLogPath(t, logDir)
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	if !strings.Contains(string(content), "=== API RESPONSE ===") {
+		t.Fatalf("log missing API response section: %s", string(content))
+	}
+	if !strings.Contains(string(content), "Error: upstream stream disconnected") {
+		t.Fatalf("log missing upstream error: %s", string(content))
+	}
+}
+
+func TestFinalizeForceLogsAPIWebsocketErrorWhenLoggerDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logDir := t.TempDir()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	wrapper := &ResponseWriterWrapper{
+		ResponseWriter: c.Writer,
+		logger:         logging.NewFileRequestLogger(false, logDir, "", 10),
+		requestInfo: &RequestInfo{
+			URL:    "/v1/responses",
+			Method: "GET",
+			Headers: map[string][]string{
+				"Connection": {"Upgrade"},
+				"Upgrade":    {"websocket"},
+			},
+			RequestID: "req-websocket-error",
+			Timestamp: time.Date(2026, time.April, 14, 12, 1, 0, 0, time.UTC),
+		},
+		logOnErrorOnly: true,
+		isStreaming:    true,
+	}
+	c.Writer = wrapper
+
+	ctx := context.WithValue(context.Background(), "gin", c)
+	helps.RecordAPIWebsocketError(ctx, &config.Config{SDKConfig: config.SDKConfig{RequestLog: false}}, "read", errors.New("upstream websocket closed"))
+
+	if err := wrapper.Finalize(c); err != nil {
+		t.Fatalf("Finalize error: %v", err)
+	}
+
+	logPath := singleErrorLogPath(t, logDir)
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	if !strings.Contains(string(content), "=== API WEBSOCKET TIMELINE ===") {
+		t.Fatalf("log missing websocket timeline: %s", string(content))
+	}
+	if !strings.Contains(string(content), "Event: api.websocket.error") {
+		t.Fatalf("log missing websocket error event: %s", string(content))
+	}
+	if !strings.Contains(string(content), "Error: upstream websocket closed") {
+		t.Fatalf("log missing websocket error detail: %s", string(content))
+	}
+}
+
+func singleErrorLogPath(t *testing.T, logDir string) string {
+	t.Helper()
+
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		t.Fatalf("read log dir: %v", err)
+	}
+
+	var errorLogs []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
+			errorLogs = append(errorLogs, filepath.Join(logDir, entry.Name()))
+		}
+	}
+	if len(errorLogs) != 1 {
+		t.Fatalf("error log count = %d, want 1", len(errorLogs))
+	}
+	return errorLogs[0]
 }
 
 type testRequestLogger struct {

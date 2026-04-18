@@ -10,6 +10,26 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
+type schedulerTestGinContext struct {
+	values  map[string]any
+	headers map[string]string
+}
+
+func (c *schedulerTestGinContext) Get(key string) (any, bool) {
+	if c == nil || c.values == nil {
+		return nil, false
+	}
+	value, ok := c.values[key]
+	return value, ok
+}
+
+func (c *schedulerTestGinContext) GetHeader(key string) string {
+	if c == nil || c.headers == nil {
+		return ""
+	}
+	return c.headers[http.CanonicalHeaderKey(key)]
+}
+
 type schedulerTestExecutor struct{}
 
 func (schedulerTestExecutor) Identifier() string { return "test" }
@@ -55,6 +75,70 @@ func newSchedulerForTest(selector Selector, auths ...*Auth) *authScheduler {
 	scheduler := newAuthScheduler(selector)
 	scheduler.rebuild(auths)
 	return scheduler
+}
+
+func contextWithAPIKey(apiKey string) context.Context {
+	if apiKey == "" {
+		return context.Background()
+	}
+	return context.WithValue(context.Background(), "gin", &schedulerTestGinContext{
+		values: map[string]any{"apiKey": apiKey},
+	})
+}
+
+func contextWithAPIKeyAndSession(apiKey, sessionID string) context.Context {
+	ginCtx := &schedulerTestGinContext{
+		values:  map[string]any{"apiKey": apiKey},
+		headers: map[string]string{},
+	}
+	if sessionID != "" {
+		ginCtx.headers[http.CanonicalHeaderKey("Session_id")] = sessionID
+	}
+	return context.WithValue(context.Background(), "gin", ginCtx)
+}
+
+func contextWithAPIKeyAndTurnSession(apiKey, sessionID string) context.Context {
+	ginCtx := &schedulerTestGinContext{
+		values:  map[string]any{"apiKey": apiKey},
+		headers: map[string]string{},
+	}
+	if sessionID != "" {
+		ginCtx.headers[http.CanonicalHeaderKey("X-Codex-Turn-Metadata")] = `{"session_id":"` + sessionID + `"}`
+	}
+	return context.WithValue(context.Background(), "gin", ginCtx)
+}
+
+func executeSelectedAuthIDForTest(t *testing.T, manager *Manager, ctx context.Context, provider string) string {
+	t.Helper()
+
+	selectedAuthID := ""
+	_, errExec := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+				selectedAuthID = authID
+			},
+		},
+	})
+	if errExec != nil {
+		t.Fatalf("Execute() error = %v", errExec)
+	}
+	if selectedAuthID == "" {
+		t.Fatalf("selectedAuthID = empty")
+	}
+	return selectedAuthID
+}
+
+func sessionBindingAuthIDForTest(t *testing.T, scheduler *authScheduler, ctx context.Context) string {
+	t.Helper()
+
+	key := codexSessionAffinityKey(ctx, "codex", "")
+	if key == "" {
+		t.Fatalf("codexSessionAffinityKey() = empty")
+	}
+
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	return scheduler.codexSessionAffinity[key]
 }
 
 func registerSchedulerModels(t *testing.T, provider string, model string, authIDs ...string) {
@@ -116,6 +200,233 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 		if got.ID != "a" {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "a")
 		}
+	}
+}
+
+func TestManager_Execute_CodexAPIKeyAffinity_ReusesAssignedAuth(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+
+	ctx := contextWithAPIKey("key-a")
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, ctx, "codex")
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, ctx, "codex")
+	if secondAuthID != firstAuthID {
+		t.Fatalf("secondAuthID = %q, want %q", secondAuthID, firstAuthID)
+	}
+}
+
+func TestManager_Execute_CodexAPIKeyAffinity_SpreadsAcrossDifferentAPIKeys(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, contextWithAPIKey("key-a"), "codex")
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, contextWithAPIKey("key-b"), "codex")
+	if secondAuthID == firstAuthID {
+		t.Fatalf("secondAuthID = %q, want auth different from %q", secondAuthID, firstAuthID)
+	}
+}
+
+func TestManager_Execute_CodexAPIKeyAffinity_FallsBackToSharedWhenAuthsExhausted(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, contextWithAPIKey("key-a"), "codex")
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, contextWithAPIKey("key-b"), "codex")
+	thirdAuthID := executeSelectedAuthIDForTest(t, manager, contextWithAPIKey("key-c"), "codex")
+	if secondAuthID == firstAuthID {
+		t.Fatalf("secondAuthID = %q, want auth different from %q", secondAuthID, firstAuthID)
+	}
+	if thirdAuthID != firstAuthID && thirdAuthID != secondAuthID {
+		t.Fatalf("thirdAuthID = %q, want one of %q or %q", thirdAuthID, firstAuthID, secondAuthID)
+	}
+}
+
+func TestManager_Execute_CodexAPIKeyAffinity_RebindsWhenPreferredAuthBecomesUnavailable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-c", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-c) error = %v", errRegister)
+	}
+
+	ctx := contextWithAPIKey("key-a")
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, ctx, "codex")
+	if _, errUpdate := manager.Update(context.Background(), &Auth{ID: firstAuthID, Provider: "codex", Disabled: true}); errUpdate != nil {
+		t.Fatalf("Update(%s disabled) error = %v", firstAuthID, errUpdate)
+	}
+
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, ctx, "codex")
+	if secondAuthID == firstAuthID {
+		t.Fatalf("secondAuthID = %q, want auth different from disabled auth %q", secondAuthID, firstAuthID)
+	}
+
+	if _, errUpdate := manager.Update(context.Background(), &Auth{ID: firstAuthID, Provider: "codex", Disabled: false}); errUpdate != nil {
+		t.Fatalf("Update(%s enabled) error = %v", firstAuthID, errUpdate)
+	}
+
+	thirdAuthID := executeSelectedAuthIDForTest(t, manager, ctx, "codex")
+	if thirdAuthID != secondAuthID {
+		t.Fatalf("thirdAuthID = %q, want rebound auth %q", thirdAuthID, secondAuthID)
+	}
+}
+
+func TestManager_Execute_CodexSessionAffinity_SpreadsAcrossSessionsWithinAPIKey(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+
+	firstCtx := contextWithAPIKeyAndSession("key-a", "sess-1")
+	secondCtx := contextWithAPIKeyAndSession("key-a", "sess-2")
+
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, firstCtx, "codex")
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, secondCtx, "codex")
+	if secondAuthID == firstAuthID {
+		t.Fatalf("secondAuthID = %q, want auth different from %q", secondAuthID, firstAuthID)
+	}
+
+	reusedAuthID := executeSelectedAuthIDForTest(t, manager, firstCtx, "codex")
+	if reusedAuthID != firstAuthID {
+		t.Fatalf("reusedAuthID = %q, want %q", reusedAuthID, firstAuthID)
+	}
+}
+
+func TestManager_Execute_CodexSessionAffinity_FallbackShareDoesNotCreateBinding(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+
+	firstCtx := contextWithAPIKeyAndSession("key-a", "sess-1")
+	secondCtx := contextWithAPIKeyAndSession("key-a", "sess-2")
+	overflowCtx := contextWithAPIKeyAndSession("key-a", "sess-3")
+
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, firstCtx, "codex")
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, secondCtx, "codex")
+	overflowAuthID := executeSelectedAuthIDForTest(t, manager, overflowCtx, "codex")
+
+	if overflowAuthID != firstAuthID && overflowAuthID != secondAuthID {
+		t.Fatalf("overflowAuthID = %q, want one of %q or %q", overflowAuthID, firstAuthID, secondAuthID)
+	}
+	if gotBinding := sessionBindingAuthIDForTest(t, manager.scheduler, overflowCtx); gotBinding != "" {
+		t.Fatalf("overflow binding = %q, want empty", gotBinding)
+	}
+}
+
+func TestScheduler_CodexSessionAffinity_ExpiresAfterTTL(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "codex-a", Provider: "codex"},
+		&Auth{ID: "codex-b", Provider: "codex"},
+	)
+	firstCtx := contextWithAPIKeyAndSession("key-a", "sess-1")
+	secondCtx := contextWithAPIKeyAndSession("key-a", "sess-2")
+	now := time.Now()
+
+	scheduler.rememberCodexSessionAffinity(firstCtx, "codex", "codex-a", false, now)
+	scheduler.rememberCodexSessionAffinity(secondCtx, "codex", "codex-b", false, now)
+
+	sessionKey := codexSessionAffinityKey(firstCtx, "codex", "")
+	if sessionKey == "" {
+		t.Fatal("sessionKey = empty")
+	}
+
+	scheduler.mu.Lock()
+	owner := scheduler.codexSessionOwners["codex-a"]
+	owner.lastRequestAt = now.Add(-codexSessionAffinityTTL - time.Minute)
+	scheduler.codexSessionOwners["codex-a"] = owner
+	scheduler.cleanupCodexAffinityAtLocked(now)
+	gotBinding := scheduler.codexSessionAffinity[sessionKey]
+	scheduler.mu.Unlock()
+
+	if gotBinding != "" {
+		t.Fatalf("expired binding = %q, want empty", gotBinding)
+	}
+}
+
+func TestManager_Execute_CodexSessionAffinity_SameSessionIDDifferentAPIKeysDoNotShare(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, contextWithAPIKeyAndSession("key-a", "shared-session"), "codex")
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, contextWithAPIKeyAndSession("key-b", "shared-session"), "codex")
+	if secondAuthID == firstAuthID {
+		t.Fatalf("secondAuthID = %q, want auth different from %q", secondAuthID, firstAuthID)
+	}
+}
+
+func TestManager_Execute_CodexSessionAffinity_UsesTurnMetadataWhenSessionHeaderMissing(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(codex-b) error = %v", errRegister)
+	}
+
+	firstCtx := contextWithAPIKeyAndTurnSession("key-a", "sess-1")
+	secondCtx := contextWithAPIKeyAndTurnSession("key-a", "sess-2")
+
+	firstAuthID := executeSelectedAuthIDForTest(t, manager, firstCtx, "codex")
+	secondAuthID := executeSelectedAuthIDForTest(t, manager, secondCtx, "codex")
+	if secondAuthID == firstAuthID {
+		t.Fatalf("secondAuthID = %q, want auth different from %q", secondAuthID, firstAuthID)
 	}
 }
 

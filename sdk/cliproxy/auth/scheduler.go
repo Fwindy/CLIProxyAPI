@@ -32,12 +32,24 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
+	mu                   sync.Mutex
+	strategy             schedulerStrategy
+	providers            map[string]*providerScheduler
+	authProviders        map[string]string
+	mixedCursors         map[string]int
+	codexAffinity        map[string]string
+	codexOwners          map[string]string
+	codexSessionAffinity map[string]string
+	codexSessionOwners   map[string]codexSessionOwner
 }
+
+type codexSessionOwner struct {
+	apiKey        string
+	sessionID     string
+	lastRequestAt time.Time
+}
+
+const codexSessionAffinityTTL = 5 * time.Hour
 
 // providerScheduler stores auth metadata and model shards for a single provider.
 type providerScheduler struct {
@@ -166,10 +178,14 @@ func normalizeCursor(cursor, size int) int {
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:      selectorStrategy(selector),
-		providers:     make(map[string]*providerScheduler),
-		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
+		strategy:             selectorStrategy(selector),
+		providers:            make(map[string]*providerScheduler),
+		authProviders:        make(map[string]string),
+		mixedCursors:         make(map[string]int),
+		codexAffinity:        make(map[string]string),
+		codexOwners:          make(map[string]string),
+		codexSessionAffinity: make(map[string]string),
+		codexSessionOwners:   make(map[string]codexSessionOwner),
 	}
 }
 
@@ -206,10 +222,23 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	s.providers = make(map[string]*providerScheduler)
 	s.authProviders = make(map[string]string)
 	s.mixedCursors = make(map[string]int)
+	if s.codexAffinity == nil {
+		s.codexAffinity = make(map[string]string)
+	}
+	if s.codexOwners == nil {
+		s.codexOwners = make(map[string]string)
+	}
+	if s.codexSessionAffinity == nil {
+		s.codexSessionAffinity = make(map[string]string)
+	}
+	if s.codexSessionOwners == nil {
+		s.codexSessionOwners = make(map[string]codexSessionOwner)
+	}
 	now := time.Now()
 	for _, auth := range auths {
 		s.upsertAuthLocked(auth, now)
 	}
+	s.cleanupCodexAffinityAtLocked(now)
 }
 
 // upsertAuth incrementally synchronizes one auth into the scheduler.
@@ -245,14 +274,18 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
+	affinityKey := codexAffinityKey(ctx, providerKey, pinnedAuthID)
+	sessionKey := codexSessionAffinityKey(ctx, providerKey, pinnedAuthID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	s.cleanupCodexAffinityAtLocked(now)
 	providerState := s.providers[providerKey]
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	shard := providerState.ensureModelLocked(modelKey, time.Now())
+	shard := providerState.ensureModelLocked(modelKey, now)
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -269,6 +302,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 			}
 		}
 		return true
+	}
+	if picked := s.pickCodexAffinityLocked(shard, preferWebsocket, affinityKey, sessionKey, s.strategy, predicate); picked != nil {
+		return picked, nil
 	}
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
 		return picked, nil
@@ -300,9 +336,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	modelKey := canonicalModelKey(model)
+	affinityKey := codexAffinityKey(ctx, "codex", pinnedAuthID)
+	sessionKey := codexSessionAffinityKey(ctx, "codex", pinnedAuthID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	s.cleanupCodexAffinityAtLocked(now)
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
@@ -312,7 +352,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if providerState == nil {
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		shard := providerState.ensureModelLocked(modelKey, time.Now())
+		shard := providerState.ensureModelLocked(modelKey, now)
 		predicate := func(entry *scheduledAuth) bool {
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
@@ -333,7 +373,6 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
-	now := time.Now()
 	for providerIndex, providerKey := range normalized {
 		providerState := s.providers[providerKey]
 		if providerState == nil {
@@ -362,6 +401,11 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			shard := candidateShards[providerIndex]
 			if shard == nil {
 				continue
+			}
+			if providerKey == "codex" {
+				if picked := s.pickCodexAffinityAtPriorityLocked(shard, false, bestPriority, affinityKey, sessionKey, s.strategy, predicate); picked != nil {
+					return picked, providerKey, nil
+				}
 			}
 			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
 			if picked != nil {
@@ -417,6 +461,12 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
+		if providerKey == "codex" {
+			if picked := s.pickCodexAffinityAtPriorityLocked(shard, false, bestPriority, affinityKey, sessionKey, schedulerStrategyRoundRobin, predicate); picked != nil {
+				s.mixedCursors[cursorKey] = slot + 1
+				return picked, providerKey, nil
+			}
+		}
 		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
 		if picked == nil {
 			continue
@@ -425,6 +475,305 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return picked, providerKey, nil
 	}
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+}
+
+type contextValueGetter interface {
+	Get(string) (any, bool)
+}
+
+type contextHeaderGetter interface {
+	GetHeader(string) string
+}
+
+func codexAffinityKey(ctx context.Context, providerKey, pinnedAuthID string) string {
+	if ctx == nil || providerKey != "codex" || strings.TrimSpace(pinnedAuthID) != "" {
+		return ""
+	}
+	raw := ctx.Value("gin")
+	getter, ok := raw.(contextValueGetter)
+	if !ok || getter == nil {
+		return ""
+	}
+	value, exists := getter.Get("apiKey")
+	if !exists || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []byte:
+		return strings.TrimSpace(string(typed))
+	case interface{ String() string }:
+		return strings.TrimSpace(typed.String())
+	default:
+		return ""
+	}
+}
+
+func codexSessionID(ctx context.Context, providerKey, pinnedAuthID string) string {
+	if ctx == nil || providerKey != "codex" || strings.TrimSpace(pinnedAuthID) != "" {
+		return ""
+	}
+	raw := ctx.Value("gin")
+	getter, ok := raw.(contextHeaderGetter)
+	if !ok || getter == nil {
+		return ""
+	}
+	if sessionID := strings.TrimSpace(getter.GetHeader("Session_id")); sessionID != "" {
+		return sessionID
+	}
+	rawMetadata := strings.TrimSpace(getter.GetHeader("X-Codex-Turn-Metadata"))
+	if rawMetadata == "" {
+		return ""
+	}
+	start := strings.Index(rawMetadata, `"session_id"`)
+	if start < 0 {
+		return ""
+	}
+	remainder := rawMetadata[start+len(`"session_id"`):]
+	colon := strings.Index(remainder, ":")
+	if colon < 0 {
+		return ""
+	}
+	remainder = strings.TrimSpace(remainder[colon+1:])
+	if !strings.HasPrefix(remainder, `"`) {
+		return ""
+	}
+	remainder = remainder[1:]
+	end := strings.Index(remainder, `"`)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(remainder[:end])
+}
+
+func codexSessionAffinityKey(ctx context.Context, providerKey, pinnedAuthID string) string {
+	apiKey := codexAffinityKey(ctx, providerKey, pinnedAuthID)
+	sessionID := codexSessionID(ctx, providerKey, pinnedAuthID)
+	if apiKey == "" || sessionID == "" {
+		return ""
+	}
+	return apiKey + "\x00" + sessionID
+}
+
+func (s *authScheduler) pickCodexAffinityLocked(shard *modelScheduler, preferWebsocket bool, apiKey, sessionKey string, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+	if s == nil || shard == nil || apiKey == "" {
+		return nil
+	}
+	priorityReady, okPriority := shard.highestReadyPriorityLocked(preferWebsocket, predicate)
+	if !okPriority {
+		return nil
+	}
+	return s.pickCodexAffinityAtPriorityLocked(shard, preferWebsocket, priorityReady, apiKey, sessionKey, strategy, predicate)
+}
+
+func (s *authScheduler) pickCodexAffinityAtPriorityLocked(shard *modelScheduler, preferWebsocket bool, priority int, apiKey, sessionKey string, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+	if s == nil || shard == nil || apiKey == "" {
+		return nil
+	}
+	if sessionKey != "" {
+		if preferredAuthID := strings.TrimSpace(s.codexSessionAffinity[sessionKey]); preferredAuthID != "" {
+			preferredPredicate := func(entry *scheduledAuth) bool {
+				if !schedulerEntryMatches(entry, predicate) {
+					return false
+				}
+				return entry.auth.ID == preferredAuthID
+			}
+			if picked := shard.pickReadyAtPriorityLocked(preferWebsocket, priority, schedulerStrategyFillFirst, preferredPredicate); picked != nil {
+				return picked
+			}
+		}
+		unclaimedSessionPredicate := func(entry *scheduledAuth) bool {
+			if !schedulerEntryMatches(entry, predicate) {
+				return false
+			}
+			return s.codexAuthAvailableForSessionLocked(apiKey, sessionKey, entry.auth.ID)
+		}
+		if picked := shard.pickReadyAtPriorityLocked(preferWebsocket, priority, strategy, unclaimedSessionPredicate); picked != nil {
+			return picked
+		}
+	}
+	if preferredAuthID := strings.TrimSpace(s.codexAffinity[apiKey]); preferredAuthID != "" {
+		preferredPredicate := func(entry *scheduledAuth) bool {
+			if !schedulerEntryMatches(entry, predicate) {
+				return false
+			}
+			return entry.auth.ID == preferredAuthID
+		}
+		if picked := shard.pickReadyAtPriorityLocked(preferWebsocket, priority, schedulerStrategyFillFirst, preferredPredicate); picked != nil {
+			return picked
+		}
+	}
+	unclaimedPredicate := func(entry *scheduledAuth) bool {
+		if !schedulerEntryMatches(entry, predicate) {
+			return false
+		}
+		return s.codexAuthAvailableForAPIKeyLocked(apiKey, entry.auth.ID)
+	}
+	return shard.pickReadyAtPriorityLocked(preferWebsocket, priority, strategy, unclaimedPredicate)
+}
+
+func schedulerEntryMatches(entry *scheduledAuth, predicate func(*scheduledAuth) bool) bool {
+	if entry == nil || entry.auth == nil {
+		return false
+	}
+	if predicate == nil {
+		return true
+	}
+	return predicate(entry)
+}
+
+func (s *authScheduler) codexAuthAvailableForAPIKeyLocked(apiKey, authID string) bool {
+	if apiKey == "" || authID == "" {
+		return false
+	}
+	owner := strings.TrimSpace(s.codexOwners[authID])
+	return owner == "" || owner == apiKey
+}
+
+func (s *authScheduler) codexAuthAvailableForSessionLocked(apiKey, sessionKey, authID string) bool {
+	if apiKey == "" || sessionKey == "" || authID == "" {
+		return false
+	}
+	if !s.codexAuthAvailableForAPIKeyLocked(apiKey, authID) {
+		return false
+	}
+	owner, ok := s.codexSessionOwners[authID]
+	if !ok {
+		return true
+	}
+	return owner.apiKey == apiKey && codexSessionOwnerKey(owner.apiKey, owner.sessionID) == sessionKey
+}
+
+func (s *authScheduler) rememberCodexAffinity(ctx context.Context, provider, authID string) {
+	if s == nil {
+		return
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	authID = strings.TrimSpace(authID)
+	apiKey := codexAffinityKey(ctx, providerKey, "")
+	if providerKey != "codex" || authID == "" || apiKey == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.codexAffinity == nil {
+		s.codexAffinity = make(map[string]string)
+	}
+	if s.codexOwners == nil {
+		s.codexOwners = make(map[string]string)
+	}
+	if previousAuthID := strings.TrimSpace(s.codexAffinity[apiKey]); previousAuthID != "" && previousAuthID != authID && s.codexOwners[previousAuthID] == apiKey {
+		delete(s.codexOwners, previousAuthID)
+	}
+	s.codexAffinity[apiKey] = authID
+	if owner := strings.TrimSpace(s.codexOwners[authID]); owner == "" || owner == apiKey {
+		s.codexOwners[authID] = apiKey
+	}
+	s.rememberCodexSessionAffinityLocked(ctx, providerKey, authID, time.Now())
+}
+
+func (s *authScheduler) cleanupCodexAffinityLocked() {
+	s.cleanupCodexAffinityAtLocked(time.Now())
+}
+
+func (s *authScheduler) cleanupCodexAffinityAtLocked(now time.Time) {
+	if s == nil {
+		return
+	}
+	for apiKey, authID := range s.codexAffinity {
+		if s.authProviders[strings.TrimSpace(authID)] != "codex" {
+			delete(s.codexAffinity, apiKey)
+		}
+	}
+	for authID, apiKey := range s.codexOwners {
+		if s.authProviders[strings.TrimSpace(authID)] != "codex" || s.codexAffinity[apiKey] != authID {
+			delete(s.codexOwners, authID)
+		}
+	}
+	for sessionKey, authID := range s.codexSessionAffinity {
+		owner, ok := s.codexSessionOwners[strings.TrimSpace(authID)]
+		if !ok || s.authProviders[strings.TrimSpace(authID)] != "codex" {
+			delete(s.codexSessionAffinity, sessionKey)
+			continue
+		}
+		if owner.lastRequestAt.IsZero() || now.Sub(owner.lastRequestAt) > codexSessionAffinityTTL || codexSessionOwnerKey(owner.apiKey, owner.sessionID) != sessionKey {
+			delete(s.codexSessionAffinity, sessionKey)
+		}
+	}
+	for authID, owner := range s.codexSessionOwners {
+		if s.authProviders[strings.TrimSpace(authID)] != "codex" {
+			delete(s.codexSessionOwners, authID)
+			continue
+		}
+		sessionKey := codexSessionOwnerKey(owner.apiKey, owner.sessionID)
+		if sessionKey == "" || owner.lastRequestAt.IsZero() || now.Sub(owner.lastRequestAt) > codexSessionAffinityTTL || s.codexSessionAffinity[sessionKey] != authID {
+			delete(s.codexSessionOwners, authID)
+		}
+	}
+}
+
+func codexSessionOwnerKey(apiKey, sessionID string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	sessionID = strings.TrimSpace(sessionID)
+	if apiKey == "" || sessionID == "" {
+		return ""
+	}
+	return apiKey + "\x00" + sessionID
+}
+
+func (s *authScheduler) rememberCodexSessionAffinity(ctx context.Context, provider, authID string, shared bool, now time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rememberCodexSessionAffinityLocked(ctx, strings.ToLower(strings.TrimSpace(provider)), strings.TrimSpace(authID), now)
+}
+
+func (s *authScheduler) rememberCodexSessionAffinityLocked(ctx context.Context, providerKey, authID string, now time.Time) {
+	sessionKey := codexSessionAffinityKey(ctx, providerKey, "")
+	if providerKey != "codex" || authID == "" || sessionKey == "" {
+		return
+	}
+	apiKey, sessionID, ok := splitCodexSessionAffinityKey(sessionKey)
+	if !ok {
+		return
+	}
+	if s.codexSessionAffinity == nil {
+		s.codexSessionAffinity = make(map[string]string)
+	}
+	if s.codexSessionOwners == nil {
+		s.codexSessionOwners = make(map[string]codexSessionOwner)
+	}
+	if existingOwner, ok := s.codexSessionOwners[authID]; ok {
+		existingKey := codexSessionOwnerKey(existingOwner.apiKey, existingOwner.sessionID)
+		if existingKey != "" && existingKey != sessionKey {
+			return
+		}
+	}
+	if previousAuthID := strings.TrimSpace(s.codexSessionAffinity[sessionKey]); previousAuthID != "" && previousAuthID != authID {
+		delete(s.codexSessionOwners, previousAuthID)
+	}
+	s.codexSessionAffinity[sessionKey] = authID
+	s.codexSessionOwners[authID] = codexSessionOwner{
+		apiKey:        apiKey,
+		sessionID:     sessionID,
+		lastRequestAt: now,
+	}
+}
+
+func splitCodexSessionAffinityKey(key string) (string, string, bool) {
+	parts := strings.SplitN(key, "\x00", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	apiKey := strings.TrimSpace(parts[0])
+	sessionID := strings.TrimSpace(parts[1])
+	if apiKey == "" || sessionID == "" {
+		return "", "", false
+	}
+	return apiKey, sessionID, true
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.

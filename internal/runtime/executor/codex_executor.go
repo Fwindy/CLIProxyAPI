@@ -124,6 +124,11 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	if cliproxyauth.CodexInstallationIDRequested(req.Context(), codexInstallationIDRequestBody(req)) {
+		if installationID, _ := cliproxyauth.EnsureCodexInstallationID(auth); installationID != "" {
+			req.Header.Set(cliproxyauth.CodexInstallationIDHeaderName, installationID)
+		}
+	}
 	return nil
 }
 
@@ -191,7 +196,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, originalPayloadSource)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -342,7 +347,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg, originalPayloadSource)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -440,7 +445,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, originalPayloadSource)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -708,7 +713,11 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
+		logCodexRefreshFailure(auth, err)
 		return nil, err
+	}
+	if td.RefreshToken == "" && refreshToken != "" {
+		logCodexRefreshMissingReplacement(auth, td)
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -728,6 +737,91 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
 	return auth, nil
+}
+
+func logCodexRefreshFailure(auth *cliproxyauth.Auth, err error) {
+	entry := codexRefreshLogEntry(auth, nil)
+	if kind := codexRefreshErrorKind(err); kind != "" {
+		entry = entry.WithField("error_kind", kind)
+	}
+	entry.WithError(err).Warn("codex refresh failed")
+}
+
+func logCodexRefreshMissingReplacement(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) {
+	copied := cloneAuthWithCodexTokenData(auth, td)
+	codexRefreshLogEntry(copied, td).
+		WithField("retaining_existing_refresh_token", true).
+		Warn("codex refresh succeeded without replacement refresh token")
+}
+
+func codexRefreshLogEntry(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) *log.Entry {
+	fields := log.Fields{
+		"provider": "codex",
+	}
+	if auth != nil {
+		if auth.ID != "" {
+			fields["auth_id"] = auth.ID
+		}
+		if auth.Provider != "" {
+			fields["provider"] = auth.Provider
+		}
+		if auth.Metadata != nil {
+			for _, key := range []string{"email", "account_id", "last_refresh", "expired"} {
+				if val, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(val) != "" {
+					fields[key] = strings.TrimSpace(val)
+				}
+			}
+		}
+	}
+	if td != nil {
+		if strings.TrimSpace(td.Email) != "" {
+			fields["email"] = strings.TrimSpace(td.Email)
+		}
+		if strings.TrimSpace(td.AccountID) != "" {
+			fields["account_id"] = strings.TrimSpace(td.AccountID)
+		}
+		if strings.TrimSpace(td.Expire) != "" {
+			fields["expired"] = strings.TrimSpace(td.Expire)
+		}
+	}
+	return log.WithFields(fields)
+}
+
+func codexRefreshErrorKind(err error) string {
+	if err == nil {
+		return ""
+	}
+	raw := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(raw, "refresh_token_reused"):
+		return "refresh_token_reused"
+	default:
+		return ""
+	}
+}
+
+func cloneAuthWithCodexTokenData(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) *cliproxyauth.Auth {
+	if auth == nil {
+		auth = &cliproxyauth.Auth{}
+	} else {
+		auth = auth.Clone()
+	}
+	if td == nil {
+		return auth
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if strings.TrimSpace(td.Email) != "" {
+		auth.Metadata["email"] = strings.TrimSpace(td.Email)
+	}
+	if strings.TrimSpace(td.AccountID) != "" {
+		auth.Metadata["account_id"] = strings.TrimSpace(td.AccountID)
+	}
+	if strings.TrimSpace(td.Expire) != "" {
+		auth.Metadata["expired"] = strings.TrimSpace(td.Expire)
+	}
+	return auth
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
@@ -769,9 +863,12 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	return httpReq, nil
 }
 
-func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
+func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, requestBody []byte) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+token)
+	if len(requestBody) == 0 {
+		requestBody = codexInstallationIDRequestBody(r)
+	}
 
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
@@ -783,6 +880,9 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
+	if sanitized := helps.SanitizeCodexTurnMetadata(r.Header.Get("X-Codex-Turn-Metadata")); sanitized != "" {
+		r.Header.Set("X-Codex-Turn-Metadata", sanitized)
+	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
@@ -821,6 +921,29 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+	if cliproxyauth.CodexInstallationIDRequested(r.Context(), requestBody) {
+		if installationID, _ := cliproxyauth.EnsureCodexInstallationID(auth); installationID != "" {
+			r.Header.Set(cliproxyauth.CodexInstallationIDHeaderName, installationID)
+		}
+	}
+}
+
+func codexInstallationIDRequestBody(req *http.Request) []byte {
+	if req == nil || req.GetBody == nil {
+		return nil
+	}
+	bodyReader, err := req.GetBody()
+	if err != nil || bodyReader == nil {
+		return nil
+	}
+	defer func() {
+		_ = bodyReader.Close()
+	}()
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return nil
+	}
+	return body
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
