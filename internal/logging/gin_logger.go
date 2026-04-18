@@ -4,16 +4,20 @@
 package logging
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // aiAPIPrefixes defines path prefixes for AI API requests that should have request ID tracking.
@@ -46,6 +50,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		start := time.Now()
 		path := c.Request.URL.Path
 		raw := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
+		requestBodySnapshot := snapshotAccessLogRequestBody(c.Request, path)
 
 		// Only generate request ID for AI API paths
 		var requestID string
@@ -85,6 +90,15 @@ func GinLogrusLogger() gin.HandlerFunc {
 		if creditsUsed(c) {
 			logLine += " [credits]"
 		}
+		if userAgent := strings.TrimSpace(c.Request.UserAgent()); userAgent != "" {
+			logLine += " | ua=" + strconv.Quote(userAgent)
+		}
+		if originator := strings.TrimSpace(c.Request.Header.Get("originator")); originator != "" {
+			logLine += " | originator=" + strconv.Quote(originator)
+		}
+		if instructionsCodex, ok := accessLogInstructionsCodex(c.Request, path, requestBodySnapshot); ok {
+			logLine += fmt.Sprintf(" | instructions_codex=%t", instructionsCodex)
+		}
 		if errorMessage != "" {
 			logLine = logLine + " | " + errorMessage
 		}
@@ -100,6 +114,79 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Info(logLine)
 		}
 	}
+}
+
+func snapshotAccessLogRequestBody(req *http.Request, path string) []byte {
+	if !shouldLogInstructionsCodex(req, path) || req == nil || req.Body == nil {
+		return nil
+	}
+	if req.GetBody != nil {
+		return nil
+	}
+	if strings.TrimSpace(req.Header.Get("Content-Encoding")) != "" {
+		return nil
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	return body
+}
+
+func accessLogInstructionsCodex(req *http.Request, path string, requestBodySnapshot []byte) (bool, bool) {
+	if !shouldLogInstructionsCodex(req, path) {
+		return false, false
+	}
+
+	body := requestBodySnapshot
+	if len(body) == 0 {
+		body = requestBodyClone(req)
+	}
+	if len(body) == 0 {
+		return false, true
+	}
+
+	instructions := gjson.GetBytes(body, "instructions")
+	if instructions.Type != gjson.String {
+		return false, true
+	}
+	return strings.HasPrefix(instructions.String(), "You are Codex"), true
+}
+
+func shouldLogInstructionsCodex(req *http.Request, path string) bool {
+	if req == nil || req.Method != http.MethodPost {
+		return false
+	}
+	switch path {
+	case "/v1/responses", "/responses":
+		return true
+	default:
+		return false
+	}
+}
+
+func requestBodyClone(req *http.Request) []byte {
+	if req == nil || req.GetBody == nil {
+		return nil
+	}
+	bodyReader, err := req.GetBody()
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		_ = bodyReader.Close()
+	}()
+
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return nil
+	}
+	return body
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

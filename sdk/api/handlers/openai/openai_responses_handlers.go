@@ -370,6 +370,8 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
+	logResponsesRequest(c, "responses request received", nil)
+
 	rawJSON, err := c.GetRawData()
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {

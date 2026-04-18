@@ -54,8 +54,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	passthroughSessionID := uuid.NewString()
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
-	clientIP := websocketClientAddress(c)
-	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
+	logResponsesRequest(c, "responses websocket: client connected", log.Fields{
+		"transport":  "websocket",
+		"session_id": passthroughSessionID,
+	})
 	var wsTerminateErr error
 	var wsTimelineLog strings.Builder
 	defer func() {

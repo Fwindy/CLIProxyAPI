@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
@@ -934,6 +936,63 @@ func TestResponsesWebsocketTimelineRecordsDisconnectEvent(t *testing.T) {
 	}
 }
 
+func TestResponsesWebsocketLogsClientUserAgent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var buf bytes.Buffer
+	restore := captureOpenAIStandardLogger(t, &buf)
+	defer restore()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+
+	timelineCh := make(chan string, 1)
+	router := gin.New()
+	router.GET("/v1/responses/ws", func(c *gin.Context) {
+		h.ResponsesWebsocket(c)
+		timeline := ""
+		if value, exists := c.Get(wsTimelineBodyKey); exists {
+			if body, ok := value.([]byte); ok {
+				timeline = string(body)
+			}
+		}
+		timelineCh <- timeline
+	})
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	headers := http.Header{"User-Agent": []string{"codex-cli/0.121.0"}}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+
+	closePayload := websocket.FormatCloseMessage(websocket.CloseGoingAway, "client closing")
+	if err = conn.WriteControl(websocket.CloseMessage, closePayload, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("write close control: %v", err)
+	}
+	_ = conn.Close()
+
+	select {
+	case <-timelineCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for websocket handler exit")
+	}
+
+	out := buf.String()
+	for _, want := range []string{
+		"responses websocket: client connected",
+		"\"user_agent\":\"codex-cli/0.121.0\"",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("websocket log output missing %q: %s", want, out)
+		}
+	}
+}
+
 func TestWebsocketUpstreamSupportsIncrementalInputForModel(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1001,6 +1060,24 @@ func TestWebsocketUpstreamSupportsCompactionReplayForModelFalseWhenMixedBackends
 	h := NewOpenAIResponsesAPIHandler(base)
 	if h.websocketUpstreamSupportsCompactionReplayForModel("test-model") {
 		t.Fatalf("expected mixed backend model to disable compaction replay bypass")
+	}
+}
+
+func captureOpenAIStandardLogger(t *testing.T, buf *bytes.Buffer) func() {
+	t.Helper()
+	logger := log.StandardLogger()
+	prevOut := logger.Out
+	prevFormatter := logger.Formatter
+	prevLevel := logger.Level
+
+	logger.SetOutput(io.Writer(buf))
+	logger.SetFormatter(&log.JSONFormatter{DisableTimestamp: true})
+	logger.SetLevel(log.DebugLevel)
+
+	return func() {
+		logger.SetOutput(prevOut)
+		logger.SetFormatter(prevFormatter)
+		logger.SetLevel(prevLevel)
 	}
 }
 
