@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -30,6 +31,7 @@ func newUsageTestRouter(h *Handler) *gin.Engine {
 	router := gin.New()
 	mgmt := router.Group("/v0/management")
 	mgmt.GET("/usage", h.GetUsageStatistics)
+	mgmt.POST("/usage/import", h.ImportUsageStatistics)
 	mgmt.DELETE("/usage", h.DeleteUsageRecords)
 	mgmt.GET("/usage-queue", h.GetUsageQueue)
 	return router
@@ -212,6 +214,116 @@ func TestGetUsageStatisticsFiltersByValidRange(t *testing.T) {
 func TestGetUsageStatisticsSetUsageStoreAllowsNilReceiver(t *testing.T) {
 	var h *Handler
 	h.SetUsageStore(newUsageTestStore(t))
+}
+
+func TestImportUsageStatisticsConvertsLegacyExportIntoSQLiteStore(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := newUsageTestStore(t)
+	h := &Handler{}
+	h.SetUsageStore(store)
+	router := newUsageTestRouter(h)
+
+	legacyExport := []byte(`{
+		"version": 1,
+		"exported_at": "2026-05-06T00:00:00Z",
+		"usage": {
+			"total_requests": 2,
+			"success_count": 1,
+			"failure_count": 1,
+			"total_tokens": 55,
+			"apis": {
+				"legacy-key": {
+					"total_requests": 2,
+					"total_tokens": 55,
+					"models": {
+						"gpt-5.4": {
+							"total_requests": 2,
+							"total_tokens": 55,
+							"details": [
+								{
+									"timestamp": "2020-01-02T03:04:05Z",
+									"latency_ms": 1200,
+									"source": "codex",
+									"auth_index": "auth-a",
+									"tokens": {
+										"input_tokens": 10,
+										"output_tokens": 20,
+										"reasoning_tokens": 3,
+										"cached_tokens": 4,
+										"total_tokens": 37
+									},
+									"failed": false
+								},
+								{
+									"timestamp": "2026-05-05T03:04:05Z",
+									"latency_ms": 900,
+									"source": "codex",
+									"auth_index": "auth-b",
+									"tokens": {
+										"input_tokens": 5,
+										"output_tokens": 6,
+										"total_tokens": 18
+									},
+									"failed": true
+								}
+							]
+						}
+					}
+				}
+			}
+		}
+	}`)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/usage/import", bytes.NewReader(legacyExport))
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var result struct {
+		Added   int64 `json:"added"`
+		Skipped int64 `json:"skipped"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode import result: %v body=%s", err, rec.Body.String())
+	}
+	if result.Added != 2 || result.Skipped != 0 {
+		t.Fatalf("import result = %+v, want added=2 skipped=0", result)
+	}
+
+	records, err := store.Query(context.Background(), usage.QueryRange{})
+	if err != nil {
+		t.Fatalf("query usage store: %v", err)
+	}
+	details := records["legacy-key"]["gpt-5.4"]
+	if len(details) != 2 {
+		t.Fatalf("details len = %d, want 2 payload=%v", len(details), records)
+	}
+	if got := details[0].Timestamp; !got.Equal(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("old detail timestamp = %s, want original 2020 timestamp", got)
+	}
+	if details[0].Tokens.TotalTokens != 37 || details[1].Tokens.TotalTokens != 18 {
+		t.Fatalf("tokens = %+v / %+v", details[0].Tokens, details[1].Tokens)
+	}
+	if details[1].Failed != true {
+		t.Fatalf("second detail failed = false, want true")
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v0/management/usage/import", bytes.NewReader(legacyExport))
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second import status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode second import result: %v body=%s", err, rec.Body.String())
+	}
+	if result.Added != 0 || result.Skipped != 2 {
+		t.Fatalf("second import result = %+v, want added=0 skipped=2", result)
+	}
 }
 
 func TestDeleteUsageRecords(t *testing.T) {

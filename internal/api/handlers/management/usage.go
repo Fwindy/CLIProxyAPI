@@ -1,8 +1,11 @@
 package management
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +18,40 @@ import (
 
 type deleteUsageRequest struct {
 	IDs []string `json:"ids"`
+}
+
+type importUsageResult struct {
+	Added   int64 `json:"added"`
+	Skipped int64 `json:"skipped"`
+}
+
+type legacyUsageImportPayload struct {
+	Version int                 `json:"version"`
+	Usage   legacyUsageSnapshot `json:"usage"`
+}
+
+type legacyUsageSnapshot struct {
+	APIs map[string]legacyAPISnapshot `json:"apis"`
+}
+
+type legacyAPISnapshot struct {
+	Models map[string]legacyModelSnapshot `json:"models"`
+}
+
+type legacyModelSnapshot struct {
+	Details []legacyRequestDetail `json:"details"`
+}
+
+type legacyRequestDetail struct {
+	Timestamp          time.Time        `json:"timestamp"`
+	LatencyMs          int64            `json:"latency_ms"`
+	FirstByteLatencyMs int64            `json:"first_byte_latency_ms"`
+	GenerationMs       int64            `json:"generation_ms"`
+	Source             string           `json:"source"`
+	AuthIndex          string           `json:"auth_index"`
+	ThinkingEffort     string           `json:"thinking_effort"`
+	Tokens             usage.TokenStats `json:"tokens"`
+	Failed             bool             `json:"failed"`
 }
 
 type usageQueueRecord []byte
@@ -42,6 +79,34 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	result, err := store.Query(c.Request.Context(), rng)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query usage"})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// ImportUsageStatistics imports legacy in-memory usage export JSON into the sqlite usage store.
+func (h *Handler) ImportUsageStatistics(c *gin.Context) {
+	store := h.currentUsageStore()
+	if store == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage store unavailable"})
+		return
+	}
+
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		return
+	}
+
+	snapshot, err := parseLegacyUsageSnapshot(data)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := importLegacyUsageSnapshot(c.Request.Context(), store, snapshot)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to import usage"})
 		return
 	}
 	c.JSON(http.StatusOK, result)
@@ -107,6 +172,86 @@ func (h *Handler) GetUsageQueue(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, records)
+}
+
+func parseLegacyUsageSnapshot(data []byte) (legacyUsageSnapshot, error) {
+	var payload legacyUsageImportPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return legacyUsageSnapshot{}, errors.New("invalid json")
+	}
+	if payload.Usage.APIs != nil {
+		if payload.Version != 0 && payload.Version != 1 {
+			return legacyUsageSnapshot{}, errors.New("unsupported version")
+		}
+		return payload.Usage, nil
+	}
+
+	var snapshot legacyUsageSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return legacyUsageSnapshot{}, errors.New("invalid json")
+	}
+	if snapshot.APIs == nil {
+		return legacyUsageSnapshot{}, errors.New("unsupported usage import format")
+	}
+	return snapshot, nil
+}
+
+func importLegacyUsageSnapshot(ctx context.Context, store usage.Store, snapshot legacyUsageSnapshot) (importUsageResult, error) {
+	result := importUsageResult{}
+	for apiName, apiSnapshot := range snapshot.APIs {
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			for i, detail := range modelSnapshot.Details {
+				record := usage.Record{
+					ID:                 legacyUsageRecordID(apiName, modelName, i, detail),
+					Timestamp:          detail.Timestamp,
+					APIKey:             apiName,
+					Model:              modelName,
+					Source:             detail.Source,
+					AuthIndex:          detail.AuthIndex,
+					LatencyMs:          detail.LatencyMs,
+					FirstByteLatencyMs: detail.FirstByteLatencyMs,
+					GenerationMs:       detail.GenerationMs,
+					ThinkingEffort:     detail.ThinkingEffort,
+					Tokens:             detail.Tokens,
+					Failed:             detail.Failed,
+				}
+				if err := store.Insert(ctx, record); err != nil {
+					if isDuplicateUsageRecordError(err) {
+						result.Skipped++
+						continue
+					}
+					return result, err
+				}
+				result.Added++
+			}
+		}
+	}
+	return result, nil
+}
+
+func legacyUsageRecordID(apiName, modelName string, index int, detail legacyRequestDetail) string {
+	payload := struct {
+		APIName   string              `json:"api_name"`
+		ModelName string              `json:"model_name"`
+		Index     int                 `json:"index"`
+		Detail    legacyRequestDetail `json:"detail"`
+	}{
+		APIName:   apiName,
+		ModelName: modelName,
+		Index:     index,
+		Detail:    detail,
+	}
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("legacy-%x", sum[:16])
+}
+
+func isDuplicateUsageRecordError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint failed") && strings.Contains(msg, "usage_records.id")
 }
 
 func parseUsageRange(c *gin.Context) (usage.QueryRange, bool) {
