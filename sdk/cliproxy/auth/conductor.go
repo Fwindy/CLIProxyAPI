@@ -63,7 +63,6 @@ type RefreshEvaluator interface {
 const (
 	refreshCheckInterval  = 5 * time.Second
 	refreshMaxConcurrency = 16
-	refreshQueueInterval  = time.Minute
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
 	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns

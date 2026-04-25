@@ -290,7 +290,7 @@ func TestManager_RefreshAuth_RefreshTokenReusedDisablesFutureRefreshAndPersists(
 	}
 }
 
-func TestAuthAutoRefreshLoop_Run_QueuesRefreshesAtFixedInterval(t *testing.T) {
+func TestAuthAutoRefreshLoop_Run_ConsumesQueuedRefreshesWithoutArtificialDelay(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.auths["a1"] = &Auth{ID: "a1", Provider: "codex", Metadata: map[string]any{"email": "one@example.com"}}
 	manager.auths["a2"] = &Auth{ID: "a2", Provider: "codex", Metadata: map[string]any{"email": "two@example.com"}}
@@ -302,7 +302,6 @@ func TestAuthAutoRefreshLoop_Run_QueuesRefreshesAtFixedInterval(t *testing.T) {
 	}
 
 	loop := newAuthAutoRefreshLoop(manager, refreshCheckInterval, 8)
-	loop.jobInterval = 20 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -319,10 +318,11 @@ func TestAuthAutoRefreshLoop_Run_QueuesRefreshesAtFixedInterval(t *testing.T) {
 	loop.jobs <- "a1"
 	loop.jobs <- "a2"
 
-	first := <-started
-	second := <-started
-	if delta := second.Sub(first); delta < loop.jobInterval {
-		t.Fatalf("refresh start delta = %v, want >= %v", delta, loop.jobInterval)
+	<-started
+	select {
+	case <-started:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("second refresh did not start within 100ms; worker appears artificially throttled")
 	}
 }
 

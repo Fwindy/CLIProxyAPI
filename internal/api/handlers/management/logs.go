@@ -20,6 +20,8 @@ const (
 	defaultLogFileName      = "main.log"
 	logScannerInitialBuffer = 64 * 1024
 	logScannerMaxBuffer     = 8 * 1024 * 1024
+	defaultLogsQueryLimit   = 200
+	maxLogsQueryLimit       = 1000
 )
 
 // GetLogs returns log lines with optional incremental loading.
@@ -490,7 +492,7 @@ func parseCutoff(raw string) int64 {
 func parseLimit(raw string) (int, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
-		return 0, nil
+		return defaultLogsQueryLimit, nil
 	}
 	limit, err := strconv.Atoi(value)
 	if err != nil {
@@ -498,6 +500,9 @@ func parseLimit(raw string) (int, error) {
 	}
 	if limit <= 0 {
 		return 0, fmt.Errorf("must be greater than zero")
+	}
+	if limit > maxLogsQueryLimit {
+		limit = maxLogsQueryLimit
 	}
 	return limit, nil
 }
