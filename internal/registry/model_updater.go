@@ -20,7 +20,7 @@ const (
 )
 
 var modelsURLs = []string{
-	"https://raw.githubusercontent.com/Fwindy/CLIProxyAPI/refs/heads/main/internal/registry/models/models.json"
+	"https://raw.githubusercontent.com/Fwindy/CLIProxyAPI/refs/heads/main/internal/registry/models/models.json",
 }
 
 //go:embed models/models.json
