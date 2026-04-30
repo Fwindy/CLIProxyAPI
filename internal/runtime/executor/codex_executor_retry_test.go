@@ -1,16 +1,10 @@
 package executor
 
 import (
-	"bytes"
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"testing"
 	"time"
-
-	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 )
 
 func TestParseCodexRetryAfter(t *testing.T) {
@@ -78,7 +72,6 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 		t.Fatalf("expected nil explicit retryAfter for capacity fallback, got %v", *err.RetryAfter())
 	}
 }
-
 
 func itoa(v int64) string {
 	return strconv.FormatInt(v, 10)
